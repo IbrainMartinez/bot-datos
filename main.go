@@ -14,6 +14,7 @@ import (
 	"bot-datos/config" // Ajusta según tu módulo
 
 	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 	"nhooyr.io/websocket"
@@ -24,11 +25,14 @@ type StatusResponse struct {
 	LastUpdate string `json:"last_update"`
 	TotalCount int64  `json:"total_count"`
 	URL        string `json:"url,omitempty"`
+	ID         string `json:"id,omitempty"`
+	Op         string `json:"op,omitempty"`
 }
 
 // Link representa un documento en la colección con una URL.
 type Link struct {
-	URL string `bson:"url" json:"url"`
+	ID  primitive.ObjectID `bson:"_id" json:"id"`
+	URL string             `bson:"url" json:"url"`
 }
 
 // Cliente WebSocket con mutex de escritura para evitar escrituras concurrentes
@@ -207,14 +211,24 @@ func startChangeStream(ctx context.Context, client *mongo.Client) {
 		switch changeDoc["operationType"].(string) {
 		case "insert":
 			totalCount++
+			status.Op = "insert"
 			if fullDoc, ok := changeDoc["fullDocument"].(bson.M); ok {
 				if url, ok := fullDoc["url"].(string); ok {
 					status.URL = url
+				}
+				if id, ok := fullDoc["_id"].(primitive.ObjectID); ok {
+					status.ID = id.Hex()
 				}
 			}
 		case "delete":
 			if totalCount > 0 {
 				totalCount--
+			}
+			status.Op = "delete"
+			if docKey, ok := changeDoc["documentKey"].(bson.M); ok {
+				if id, ok := docKey["_id"].(primitive.ObjectID); ok {
+					status.ID = id.Hex()
+				}
 			}
 		}
 		status.TotalCount = totalCount
