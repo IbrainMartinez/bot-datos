@@ -1,226 +1,274 @@
 package main
 
 import (
-    "context"
-    "encoding/json"
-    "log"
-    "net/http"
-    "os"
-    "os/signal"
-    "sync"
-    "syscall"
-    "time"
+	"context"
+	"encoding/json"
+	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"sync"
+	"syscall"
+	"time"
 
-    "bot-datos/config" // Ajusta según tu módulo
+	"bot-datos/config"
 
-    "go.mongodb.org/mongo-driver/bson"
-    "go.mongodb.org/mongo-driver/mongo"
-    "go.mongodb.org/mongo-driver/mongo/options"
-    "nhooyr.io/websocket"
+	"github.com/PuerkitoBio/goquery"
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/bson/primitive"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
+	"nhooyr.io/websocket"
 )
 
 // StatusResponse define la estructura del JSON que se enviará.
 type StatusResponse struct {
 	LastUpdate string `json:"last_update"`
 	TotalCount int64  `json:"total_count"`
+	URL        string `json:"url,omitempty"`
+	ID         string `json:"id,omitempty"`
+	Op         string `json:"op,omitempty"`
 }
 
-// Cliente WebSocket con mutex de escritura para evitar escrituras concurrentes
+// Link representa un documento en la colección con una URL.
+type Link struct {
+	ID  primitive.ObjectID `bson:"_id" json:"id"`
+	URL string             `bson:"url" json:"url"`
+}
+
 type Client struct {
-    conn    *websocket.Conn
-    writeMu sync.Mutex
+	conn    *websocket.Conn
+	writeMu sync.Mutex
 }
 
-// Globales para el estado y los clientes conectados
 var (
-    clients   = make(map[*Client]bool) // Mapa para registrar clientes
-    clientsMu sync.Mutex               // Mutex para proteger el mapa de clientes
-	
-	mu sync.Mutex                     // Mutex para proteger el estado del servicio
+	clients   = make(map[*Client]bool)
+	clientsMu sync.Mutex
+
+	mu         sync.Mutex
 	lastUpdate time.Time
 	totalCount int64
 )
 
 func main() {
-    // Contexto raíz cancelable para control de apagado
-    ctx, cancel := context.WithCancel(context.Background())
-    defer cancel()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-    // Señales del SO para apagado ordenado
-    sigs := make(chan os.Signal, 1)
-    signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
+	mongoClient, err := mongo.Connect(ctx, options.Client().ApplyURI(config.MongoURI))
+	if err != nil {
+		log.Fatal("Error conectando a MongoDB:", err)
+	}
+	defer mongoClient.Disconnect(ctx)
 
-    // Servidor HTTP con apagado ordenado
-    server := &http.Server{
-        Addr: ":" + config.WebsocketPort,
-    }
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
 
-    http.HandleFunc("/ws", wsHandler)
+	server := &http.Server{
+		Addr: ":" + config.WebsocketPort,
+	}
 
-    go func() {
-        log.Printf("Servidor WebSocket escuchando en puerto :%s en el endpoint /ws\n", config.WebsocketPort)
-        if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-            log.Fatalf("Error del servidor: %v", err)
-        }
-    }()
+	http.HandleFunc("/ws", wsHandler)
+	http.HandleFunc("/links", linksHandler(mongoClient))
+	http.HandleFunc("/preview", previewHandler) // nuevo endpoint
+	http.Handle("/", http.FileServer(http.Dir("./frontend")))
 
-    // Change stream
-    go startChangeStream(ctx)
+	go func() {
+		log.Printf("Servidor WebSocket escuchando en puerto :%s\n", config.WebsocketPort)
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("Error del servidor: %v", err)
+		}
+	}()
 
-    // Espera señal
-    <-sigs
-    log.Println("Recibida señal de apagado. Cerrando...")
+	go startChangeStream(ctx, mongoClient)
 
-    // Cierra servidor HTTP
-    shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
-    defer shutdownCancel()
-    if err := server.Shutdown(shutdownCtx); err != nil {
-        log.Printf("Error al apagar servidor HTTP: %v", err)
-    }
+	<-sigs
+	log.Println("Apagando...")
 
-    // Cancela contexto para terminar change stream
-    cancel()
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer shutdownCancel()
+	server.Shutdown(shutdownCtx)
+	cancel()
 
-    // Cierra conexiones de clientes
-    clientsMu.Lock()
-    for c := range clients {
-        _ = c.conn.Close(websocket.StatusNormalClosure, "Servidor apagándose")
-        delete(clients, c)
-    }
-    clientsMu.Unlock()
+	clientsMu.Lock()
+	for c := range clients {
+		_ = c.conn.Close(websocket.StatusNormalClosure, "Servidor apagándose")
+		delete(clients, c)
+	}
+	clientsMu.Unlock()
 
-    log.Println("Apagado completo.")
+	log.Println("Apagado completo.")
 }
 
 func wsHandler(w http.ResponseWriter, r *http.Request) {
-    options := &websocket.AcceptOptions{
-        OriginPatterns: config.AllowedOrigins,
-    }
-
-    conn, err := websocket.Accept(w, r, options)
+	options := &websocket.AcceptOptions{
+		OriginPatterns: config.AllowedOrigins,
+	}
+	conn, err := websocket.Accept(w, r, options)
 	if err != nil {
-		log.Println("Error al aceptar la conexión WebSocket:", err)
+		log.Println("Error al aceptar WS:", err)
 		return
 	}
 
-    client := &Client{conn: conn}
-    clientsMu.Lock()
-    clients[client] = true
-    clientsMu.Unlock()
+	client := &Client{conn: conn}
+	clientsMu.Lock()
+	clients[client] = true
+	clientsMu.Unlock()
 
-	log.Printf("Nuevo cliente conectado. Total: %d\n", len(clients))
-
-    sendInitialStatus(client)
+	sendInitialStatus(client)
 
 	ctx := r.Context()
 	for {
-        _, _, err := conn.Read(ctx)
+		_, _, err := conn.Read(ctx)
 		if err != nil {
 			break
 		}
 	}
 
 	clientsMu.Lock()
-    delete(clients, client)
+	delete(clients, client)
 	clientsMu.Unlock()
-	
-    conn.Close(websocket.StatusInternalError, "Conexión cerrada")
-	log.Printf("Cliente desconectado. Total: %d\n", len(clients))
+	_ = conn.Close(websocket.StatusNormalClosure, "bye")
 }
 
 func sendInitialStatus(client *Client) {
 	mu.Lock()
 	defer mu.Unlock()
+	lu := ""
+	if !lastUpdate.IsZero() {
+		lu = lastUpdate.Format(time.RFC3339)
+	}
 	initialStatus := StatusResponse{
-		LastUpdate: lastUpdate.Format(time.RFC3339),
+		LastUpdate: lu,
 		TotalCount: totalCount,
 	}
-	ctx := context.Background()
-    sendJSON(ctx, client, initialStatus)
+	sendJSON(context.Background(), client, initialStatus)
 }
 
-// Función corregida para enviar JSON
 func sendJSON(ctx context.Context, client *Client, data StatusResponse) {
-    client.writeMu.Lock()
-    defer client.writeMu.Unlock()
-
-    w, err := client.conn.Writer(ctx, websocket.MessageText)
-    if err != nil {
-        log.Println("Error al obtener el escritor de WebSocket:", err)
-        return
-    }
-    defer w.Close()
-
-    if err := json.NewEncoder(w).Encode(data); err != nil {
-        log.Println("Error al codificar y enviar JSON:", err)
-    }
+	client.writeMu.Lock()
+	defer client.writeMu.Unlock()
+	w, err := client.conn.Writer(ctx, websocket.MessageText)
+	if err != nil {
+		return
+	}
+	defer w.Close()
+	_ = json.NewEncoder(w).Encode(data)
 }
 
-func startChangeStream(ctx context.Context) {
-
-    client, err := mongo.Connect(ctx, options.Client().ApplyURI(config.MongoURI))
-	if err != nil {
-		log.Fatal("Error conectando a MongoDB:", err)
-	}
-	defer client.Disconnect(ctx)
-
-    dbName := config.MongoDBName
-    collName := config.MongoCollection
-    collection := client.Database(dbName).Collection(collName)
+func startChangeStream(ctx context.Context, client *mongo.Client) {
+	collection := client.Database(config.MongoDBName).Collection(config.MongoCollection)
 	initialCount, err := collection.CountDocuments(ctx, bson.M{})
 	if err != nil {
-		log.Fatal("Error obteniendo el conteo inicial:", err)
+		log.Fatal(err)
 	}
 	mu.Lock()
 	totalCount = initialCount
 	mu.Unlock()
-	log.Printf("Conteo inicial de documentos: %d\n", initialCount)
 
 	opts := options.ChangeStream().SetFullDocument(options.UpdateLookup)
 	changeStream, err := collection.Watch(ctx, mongo.Pipeline{}, opts)
 	if err != nil {
-		log.Fatal("Error creando Change Stream:", err)
+		log.Fatal(err)
 	}
 	defer changeStream.Close(ctx)
-
-    log.Printf("Escuchando cambios en la colección '%s.%s'...\n", dbName, collName)
 
 	for changeStream.Next(ctx) {
 		var changeDoc bson.M
 		if err := changeStream.Decode(&changeDoc); err != nil {
-			log.Println("Error decodificando cambio:", err)
 			continue
 		}
 
 		mu.Lock()
 		lastUpdate = time.Now()
+		status := StatusResponse{LastUpdate: lastUpdate.Format(time.RFC3339)}
 		switch changeDoc["operationType"].(string) {
 		case "insert":
 			totalCount++
+			status.Op = "insert"
+			if fullDoc, ok := changeDoc["fullDocument"].(bson.M); ok {
+				if url, ok := fullDoc["url"].(string); ok {
+					status.URL = url
+				}
+				if id, ok := fullDoc["_id"].(primitive.ObjectID); ok {
+					status.ID = id.Hex()
+				}
+			}
 		case "delete":
 			if totalCount > 0 {
 				totalCount--
 			}
+			status.Op = "delete"
+			if docKey, ok := changeDoc["documentKey"].(bson.M); ok {
+				if id, ok := docKey["_id"].(primitive.ObjectID); ok {
+					status.ID = id.Hex()
+				}
+			}
 		}
+		status.TotalCount = totalCount
 
-		status := StatusResponse{
-			LastUpdate: lastUpdate.Format(time.RFC3339),
-			TotalCount: totalCount,
+		clientsMu.Lock()
+		for c := range clients {
+			go func(cl *Client, snap StatusResponse) {
+				sendJSON(ctx, cl, snap)
+			}(c, status)
 		}
-		
-        clientsMu.Lock()
-        for c := range clients {
-            // envío secuencial por cliente protegido por su mutex interno
-            go func(clientRef *Client, snapshot StatusResponse) {
-                sendJSON(ctx, clientRef, snapshot)
-            }(c, status)
-        }
-        clientsMu.Unlock()
-		
+		clientsMu.Unlock()
 		mu.Unlock()
 	}
+}
 
-	if err := changeStream.Err(); err != nil {
-		log.Fatal("Error en el Change Stream:", err)
+func linksHandler(client *mongo.Client) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		coll := client.Database(config.MongoDBName).Collection(config.MongoCollection)
+		ctx := r.Context()
+		cursor, err := coll.Find(ctx, bson.M{})
+		if err != nil {
+			http.Error(w, "DB error", http.StatusInternalServerError)
+			return
+		}
+		defer cursor.Close(ctx)
+
+		var links []Link
+		if err := cursor.All(ctx, &links); err != nil {
+			http.Error(w, "decode error", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(links)
 	}
+}
+
+// Nuevo: endpoint para obtener la imagen OG
+func previewHandler(w http.ResponseWriter, r *http.Request) {
+	url := r.URL.Query().Get("u")
+	if url == "" {
+		http.Error(w, "missing u", http.StatusBadRequest)
+		return
+	}
+	req, _ := http.NewRequest("GET", url, nil)
+	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; LinkPreviewBot/1.0)")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		http.Error(w, "fetch error", http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	doc, err := goquery.NewDocumentFromReader(resp.Body)
+	if err != nil {
+		http.Error(w, "parse error", http.StatusBadGateway)
+		return
+	}
+	og := ""
+	doc.Find(`meta[property="og:image"]`).Each(func(i int, s *goquery.Selection) {
+		if v, ok := s.Attr("content"); ok && og == "" {
+			og = v
+		}
+	})
+	if og == "" {
+		http.Error(w, "no image", http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain")
+	w.Write([]byte(og))
 }

@@ -1,21 +1,34 @@
 <!DOCTYPE html>
 <html lang="en">
-
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>HELLO WORD</title>
+    <style>
+        #linksContainer {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+        }
+        .card {
+            width: 300px;
+        }
+        .card img {
+            width: 100%;
+        }
+    </style>
 </head>
-
 <body>
-    <H1>HOLA</H1>
+    <h1>HOLA</h1>
     <p>Estado: <span id="estado">desconectado</span></p>
     <p>Última actualización: <span id="lastUpdate">-</span></p>
     <p>Conteo actual: <span id="contador">-</span></p>
+    <div id="linksContainer"></div>
     <script>
         const estadoEl = document.getElementById('estado');
         const lastUpdateEl = document.getElementById('lastUpdate');
         const contadorElemento = document.getElementById('contador');
+        const linksContainer = document.getElementById('linksContainer');
 
         const WS_URL = (location.hostname === 'localhost' || location.hostname === '127.0.0.1')
             ? `ws://${location.hostname}:8080/ws`
@@ -26,36 +39,59 @@
 
         function connect() {
             socket = new WebSocket(WS_URL);
-
             socket.onopen = () => {
-                console.log('Conexión WebSocket abierta');
                 estadoEl.textContent = 'conectado';
                 retryMs = 500;
             };
-
             socket.onmessage = (event) => {
                 const data = JSON.parse(event.data);
-                console.log('Datos recibidos del servidor:', data);
-                if (contadorElemento) contadorElemento.textContent = data.total_count ?? '-';
-                if (lastUpdateEl) lastUpdateEl.textContent = data.last_update ?? '-';
+                contadorElemento.textContent = data.total_count ?? '-';
+                lastUpdateEl.textContent = data.last_update ?? '-';
+                if (data.op === 'insert' && data.url && data.id) {
+                    addCard({ id: data.id, url: data.url });
+                } else if (data.op === 'delete' && data.id) {
+                    removeCard(data.id);
+                }
             };
-
             socket.onclose = () => {
-                console.log('Conexión WebSocket cerrada');
                 estadoEl.textContent = 'reconectando...';
-                setTimeout(() => {
-                    retryMs = Math.min(retryMs * 2, 5000);
-                    connect();
-                }, retryMs);
-            };
-
-            socket.onerror = (error) => {
-                console.error('Error en WebSocket:', error);
+                setTimeout(connect, Math.min(retryMs *= 2, 5000));
             };
         }
-
         connect();
+
+        async function addCard(link) {
+            const card = document.createElement('div');
+            card.className = 'card';
+            card.dataset.id = link.id;
+
+            const img = document.createElement('img');
+            try {
+                const res = await fetch(`/preview?u=${encodeURIComponent(link.url)}`);
+                if (!res.ok) throw new Error();
+                img.src = await res.text();
+            } catch {
+                img.src = `https://www.google.com/s2/favicons?sz=128&domain_url=${encodeURIComponent(link.url)}`;
+            }
+            img.alt = link.url;
+
+            const a = document.createElement('a');
+            a.href = link.url;
+            a.textContent = link.url;
+
+            card.appendChild(img);
+            card.appendChild(a);
+            linksContainer.appendChild(card);
+        }
+
+        function removeCard(id) {
+            const card = linksContainer.querySelector(`[data-id='${id}']`);
+            if (card) card.remove();
+        }
+
+        fetch('/links')
+            .then(r => r.json())
+            .then(links => links.forEach(link => addCard(link)));
     </script>
 </body>
-
 </html>
