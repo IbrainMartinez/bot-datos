@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HELLO WORD</title>
+</head>
+
+<body>
+    <H1>HOLA</H1>
+    <p>Estado: <span id="estado">desconectado</span></p>
+    <p>Última actualización: <span id="lastUpdate">-</span></p>
+    <p>Conteo actual: <span id="contador">-</span></p>
+    <script>
+        const estadoEl = document.getElementById('estado');
+        const lastUpdateEl = document.getElementById('lastUpdate');
+        const contadorElemento = document.getElementById('contador');
+
+        const WS_URL = (location.hostname === 'localhost' || location.hostname === '127.0.0.1')
+            ? `ws://${location.hostname}:8080/ws`
+            : `wss://${location.host}/ws`;
+
+        let socket;
+        let retryMs = 500;
+
+        function connect() {
+            socket = new WebSocket(WS_URL);
+
+            socket.onopen = () => {
+                console.log('Conexión WebSocket abierta');
+                estadoEl.textContent = 'conectado';
+                retryMs = 500;
+            };
+
+            socket.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+                console.log('Datos recibidos del servidor:', data);
+                if (contadorElemento) contadorElemento.textContent = data.total_count ?? '-';
+                if (lastUpdateEl) lastUpdateEl.textContent = data.last_update ?? '-';
+            };
+
+            socket.onclose = () => {
+                console.log('Conexión WebSocket cerrada');
+                estadoEl.textContent = 'reconectando...';
+                setTimeout(() => {
+                    retryMs = Math.min(retryMs * 2, 5000);
+                    connect();
+                }, retryMs);
+            };
+
+            socket.onerror = (error) => {
+                console.error('Error en WebSocket:', error);
+            };
+        }
+
+        connect();
+    </script>
+</body>
+
+</html>
