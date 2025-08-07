@@ -55,6 +55,7 @@
                 console.log('Datos recibidos del servidor:', data);
                 if (contadorElemento) contadorElemento.textContent = data.total_count ?? '-';
                 if (lastUpdateEl) lastUpdateEl.textContent = data.last_update ?? '-';
+                if (data.url) addCard(data.url);
             };
 
             socket.onclose = () => {
@@ -74,22 +75,24 @@
         connect();
 
         // Carga las URLs desde el servidor y muestra una vista previa
+        function addCard(url) {
+            const card = document.createElement('div');
+            card.className = 'card';
+            const img = document.createElement('img');
+            img.src = `https://image.thum.io/get/width/600/${url}`;
+            img.alt = url;
+            const a = document.createElement('a');
+            a.href = url;
+            a.textContent = url;
+            card.appendChild(img);
+            card.appendChild(a);
+            linksContainer.appendChild(card);
+        }
+
         fetch('/links')
             .then(r => r.json())
             .then(links => {
-                links.forEach(link => {
-                    const card = document.createElement('div');
-                    card.className = 'card';
-                    const img = document.createElement('img');
-                    img.src = `https://image.thum.io/get/width/600/${link.url}`;
-                    img.alt = link.url;
-                    const a = document.createElement('a');
-                    a.href = link.url;
-                    a.textContent = link.url;
-                    card.appendChild(img);
-                    card.appendChild(a);
-                    linksContainer.appendChild(card);
-                });
+                links.forEach(link => addCard(link.url));
             })
             .catch(err => console.error('Error cargando links', err));
     </script>

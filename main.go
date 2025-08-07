@@ -23,6 +23,7 @@ import (
 type StatusResponse struct {
 	LastUpdate string `json:"last_update"`
 	TotalCount int64  `json:"total_count"`
+	URL        string `json:"url,omitempty"`
 }
 
 // Link representa un documento en la colección con una URL.
@@ -202,19 +203,21 @@ func startChangeStream(ctx context.Context, client *mongo.Client) {
 
 		mu.Lock()
 		lastUpdate = time.Now()
+		status := StatusResponse{LastUpdate: lastUpdate.Format(time.RFC3339)}
 		switch changeDoc["operationType"].(string) {
 		case "insert":
 			totalCount++
+			if fullDoc, ok := changeDoc["fullDocument"].(bson.M); ok {
+				if url, ok := fullDoc["url"].(string); ok {
+					status.URL = url
+				}
+			}
 		case "delete":
 			if totalCount > 0 {
 				totalCount--
 			}
 		}
-
-		status := StatusResponse{
-			LastUpdate: lastUpdate.Format(time.RFC3339),
-			TotalCount: totalCount,
-		}
+		status.TotalCount = totalCount
 
 		clientsMu.Lock()
 		for c := range clients {
